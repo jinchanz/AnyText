@@ -4,7 +4,11 @@ Paper: https://arxiv.org/abs/2311.03054
 Code: https://github.com/tyxsspa/AnyText
 Copyright (c) Alibaba, Inc. and its affiliates.
 '''
+import multiprocessing
+from multiprocessing import Process
 import os
+from typing import Dict, List, Optional, Union
+from fastapi.responses import JSONResponse
 from modelscope.pipelines import pipeline
 import cv2
 import gradio as gr
@@ -14,12 +18,20 @@ from gradio.components import Component
 from util import check_channels, resize_image, save_images
 import json
 import argparse
+import uvicorn
+import fastapi
+import base64
+from io import BytesIO
+from PIL import Image
+import numpy as np
+from pydantic import BaseModel
 
 
 BBOX_MAX_NUM = 8
 img_save_folder = 'SaveImages'
 load_model = True
 
+app = fastapi.FastAPI()
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -132,10 +144,32 @@ def draw_rects(width, height, rects):
     return img
 
 
-def process(mode, prompt, pos_radio, sort_radio, revise_pos, show_debug, draw_img, rect_img, ref_img, ori_img, img_count, ddim_steps, w, h, strength, cfg_scale, seed, eta, a_prompt, n_prompt, *rect_list):
+def process(
+    mode: str,
+    prompt: str,
+    pos_radio: str,
+    sort_radio: str,
+    revise_pos: bool,
+    show_debug: bool,
+    draw_img: Optional[dict],  # 假设为字典，包含图像和可能的蒙版信息
+    rect_img: Optional[dict],  # 假设为字典，但在函数中未使用
+    ref_img: Optional[Union[dict, np.ndarray]],  # 假设为可能包含图像和蒙版的字典或 NumPy 数组
+    ori_img: Optional[Union[str, np.ndarray]],  # 假设为文件路径字符串或 NumPy 数组
+    img_count: int,
+    ddim_steps: int,
+    w: int,
+    h: int,
+    strength: float,
+    cfg_scale: float,
+    seed: int,
+    eta: float,
+    a_prompt: str,
+    n_prompt: str,
+    *rect_list: any  # 可变参数，可能包含布尔值和数字
+):
     n_lines = count_lines(prompt)
     # Text Generation
-    if mode == 'gen':
+    if mode == 'gen' or mode == 'text-generation':
         # create pos_imgs
         if pos_radio == 'Manual-draw(手绘)':
             if draw_img is not None:
@@ -157,7 +191,7 @@ def process(mode, prompt, pos_radio, sort_radio, revise_pos, show_debug, draw_im
         elif pos_radio == 'Auto-rand(随机)':
             pos_imgs = generate_rectangles(w, h, n_lines, max_trys=500)
     # Text Editing
-    elif mode == 'edit':
+    elif mode == 'edit' or mode == 'text-editing':
         revise_pos = False  # disable pos revise in edit mode
         if ref_img is None or ori_img is None:
             raise gr.Error('No reference image, please upload one for edit!')
@@ -175,26 +209,29 @@ def process(mode, prompt, pos_radio, sort_radio, revise_pos, show_debug, draw_im
                 ref_img = ref_img['image']
             pos_imgs = 255 - ref_img  # example input ref_img is used as pos
     cv2.imwrite('pos_imgs.png', 255-pos_imgs[..., ::-1])
+    cv2.imwrite('ori_img.png', 255-ori_img[..., ::-1])
     params = {
-        "sort_priority": sort_radio,
-        "show_debug": show_debug,
+        "sort_priority": sort_radio or '↔',
+        "show_debug": show_debug or False,
         "revise_pos": revise_pos,
-        "image_count": img_count,
-        "ddim_steps": ddim_steps,
+        "image_count": img_count or 1,
+        "ddim_steps": ddim_steps or 20,
         "image_width": w,
         "image_height": h,
-        "strength": strength,
-        "cfg_scale": cfg_scale,
-        "eta": eta,
-        "a_prompt": a_prompt,
-        "n_prompt": n_prompt
+        "strength": strength or 1,
+        "cfg_scale": cfg_scale or 9,
+        "eta": eta or 0,
+        "a_prompt": a_prompt or 'best quality, extremely detailed,4k, HD, supper legible text,  clear text edges,  clear strokes, neat writing, no watermarks',
+        "n_prompt": n_prompt or 'low-res, bad anatomy, extra digit, fewer digits, cropped, worst quality, low quality, watermark, unreadable text, messy words, distorted text, disorganized writing, advertising picture',
     }
     input_data = {
         "prompt": prompt,
-        "seed": seed,
+        "seed": seed or -1,
         "draw_pos": pos_imgs,
         "ori_image": ori_img,
     }
+    # print(f'input_data: {input_data}')
+    # print(f'params: {params}')
     results, rtn_code, rtn_warning, debug_info = inference(input_data, mode=mode, **params)
     if rtn_code >= 0:
         save_images(results, img_save_folder)
@@ -203,8 +240,40 @@ def process(mode, prompt, pos_radio, sort_radio, revise_pos, show_debug, draw_im
             gr.Warning(rtn_warning)
     else:
         raise gr.Error(rtn_warning)
-    return results, gr.Markdown(debug_info, visible=show_debug)
+    
+    res = []
+    if results is not None:
+        for idx, img in enumerate(results):
+            base64_img = base64.b64encode(cv2.imencode('.jpg', img[..., ::-1])[1]).decode()
+            res.append({'image': base64_img})
 
+    return res, gr.Markdown(debug_info, visible=show_debug)
+
+def process_wrapper(
+    mode, prompt, pos_radio, sort_radio, revise_pos, show_debug, draw_img_base64, rect_img_base64,
+    ref_img_base64, ori_img_base64, img_count, ddim_steps, w, h, strength, cfg_scale, seed, eta,
+    a_prompt, n_prompt, *rect_list
+):
+    # 将 Base64 编码的图片转换为 numpy 数组的辅助函数
+    def base64_to_image(base64_str):
+        if base64_str is None:
+            return None
+        image_data = base64.b64decode(base64_str)
+        image = Image.open(BytesIO(image_data))
+        return np.array(image)
+
+    # 转换图片
+    draw_img = base64_to_image(draw_img_base64) if draw_img_base64 else None
+    rect_img = base64_to_image(rect_img_base64) if rect_img_base64 else None
+    ref_img = base64_to_image(ref_img_base64) if ref_img_base64 else None
+    ori_img = base64_to_image(ori_img_base64) if ori_img_base64 else None
+
+    # 调用原始 process 函数
+    return process(
+        mode, prompt, pos_radio, sort_radio, revise_pos, show_debug, draw_img, rect_img, ref_img,
+        ori_img, img_count, ddim_steps, w, h, strength, cfg_scale, seed, eta, a_prompt, n_prompt,
+        *rect_list
+    )
 
 def create_canvas(w=512, h=512, c=3, line=5):
     image = np.full((h, w, c), 200, dtype=np.uint8)
@@ -233,9 +302,59 @@ def resize_h(h, img1, img2):
 is_t2i = 'true'
 block = gr.Blocks(css='style.css', theme=gr.themes.Soft()).queue()
 
-with open('javascript/bboxHint.js', 'r') as file:
+with open('javascript/bboxHint.js', 'r', encoding='utf-8') as file:
     value = file.read()
 escaped_value = json.dumps(value)
+
+class ProcessRequest(BaseModel):
+    mode: Optional[str] = None
+    prompt: Optional[str] = None
+    pos_radio: Optional[str] = None
+    sort_radio: Optional[str] = None
+    revise_pos: Optional[bool] = None
+    show_debug: Optional[bool] = None
+    draw_img: Optional[Dict] = None
+    rect_img: Optional[Dict] = None
+    ref_img: Optional[List] = None
+    ori_img: Optional[List] = None
+    img_count: Optional[int] = None
+    ddim_steps: Optional[int] = None
+    w: Optional[int] = None
+    h: Optional[int] = None
+    strength: Optional[float] = None
+    cfg_scale: Optional[float] = None
+    seed: Optional[int] = None
+    eta: Optional[float] = None
+    a_prompt: Optional[str] = None
+    n_prompt: Optional[str] = None
+    rect_list: Optional[List] = None
+
+
+async def process_api(req):
+    # print(f'process_api: {req}')
+    request = ProcessRequest(**req)
+    result = process_wrapper(
+        request.mode, request.prompt, request.pos_radio, request.sort_radio, request.revise_pos,
+        request.show_debug, request.draw_img, request.rect_img, (request.ref_img or [])[0], (request.ori_img or [])[0],
+        request.img_count, request.ddim_steps, request.w, request.h, request.strength, request.cfg_scale, 
+        request.seed, request.eta, request.a_prompt, request.n_prompt, *(request.rect_list or []))
+    # print(f'process_api result: {result}')
+    return JSONResponse(content=json.dumps(result[0]))
+
+def add_api_route(app, route, endpoint):
+    @app.post(route)
+    async def wrapper(request: dict):
+        return await endpoint(request)
+
+add_api_route(app, "/process", process_api)
+
+# Uvicorn 运行函数
+def run_uvicorn():
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+# 在一个新进程中运行 FastAPI/Uvicorn
+def run_fastapi():
+    Process(target=run_uvicorn).start()
 
 with block:
     block.load(fn=None,
@@ -454,9 +573,13 @@ with block:
     run_edit.click(fn=process, inputs=[gr.State('edit')] + ips, outputs=[result_gallery, result_info])
 
 
-block.launch(
-    server_name='0.0.0.0' if os.getenv('GRADIO_LISTEN', '') != '' else "127.0.0.1",
-    share=False,
-    root_path=f"/{os.getenv('GRADIO_PROXY_PATH')}" if os.getenv('GRADIO_PROXY_PATH') else ""
-)
+if __name__ == '__main__':
+    multiprocessing.set_start_method('spawn')
+    run_fastapi()
+
+    # block.launch(
+    #     server_name='0.0.0.0' if os.getenv('GRADIO_LISTEN', '') != '' else "127.0.0.1",
+    #     share=False,
+    #     root_path=f"/{os.getenv('GRADIO_PROXY_PATH')}" if os.getenv('GRADIO_PROXY_PATH') else ""
+    # )
 # block.launch(server_name='0.0.0.0')
