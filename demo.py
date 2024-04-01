@@ -330,9 +330,9 @@ class ProcessRequest(BaseModel):
     rect_list: Optional[List] = None
 
 
-async def process_api(req):
+async def process_api(request):
     # print(f'process_api: {req}')
-    request = ProcessRequest(**req)
+    # request = ProcessRequest(**req)
     result = process_wrapper(
         request.mode, request.prompt, request.pos_radio, request.sort_radio, request.revise_pos,
         request.show_debug, request.draw_img, request.rect_img, (request.ref_img or [])[0], (request.ori_img or [])[0],
@@ -343,7 +343,7 @@ async def process_api(req):
 
 def add_api_route(app, route, endpoint):
     @app.post(route)
-    async def wrapper(request: dict):
+    async def wrapper(request: ProcessRequest):
         return await endpoint(request)
 
 add_api_route(app, "/process", process_api)
